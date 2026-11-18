@@ -4,8 +4,9 @@ One daemon thread runs the whole cycle:
 
     find posts -> reply/DM them -> when the queue is empty, scan again
 
-It never needs a button. Every write still respects the caps, the cool-down and
-quiet hours, and it only creates a run when it actually does something.
+The workspace's enabled setting controls background work. Every write respects
+the caps, the cool-down and quiet hours. Pausing lets the current action finish
+and prevents the next stage from starting.
 """
 
 from __future__ import annotations
@@ -162,6 +163,9 @@ class AgentLoop(threading.Thread):
                     logger.warning("inbox check failed for user %s", user_id, exc_info=True)
                     db.rollback()
 
+        if not self._still_enabled(db, settings_row):
+            return
+
         write_action = "reply" if settings_row.use_public_reply else "dm"
 
         # 0c. Verify application links. Dead links (404, typo, redirect back to
@@ -176,6 +180,9 @@ class AgentLoop(threading.Thread):
             except Exception:  # noqa: BLE001 - never break the loop
                 logger.warning("link check failed for user %s", user_id, exc_info=True)
                 db.rollback()
+
+        if not self._still_enabled(db, settings_row):
+            return
 
         # 1. Send at most one queued post (the cool-down owns the pace).
         queued_stmt = select(func.count(JobPost.id)).where(JobPost.status == "queued")
@@ -192,6 +199,9 @@ class AgentLoop(threading.Thread):
                 run = pipeline.send_batch(db, limit=1, user_id=user_id)
                 sent_this_tick = True
                 logger.info("user %s send pass: %s %s", user_id, run.status, run.stats)
+
+        if not self._still_enabled(db, settings_row):
+            return
 
         # 2. Idle pass. Nothing queued means nothing left to apply to, so use
         # the time to scroll deeper into the home feed - that is where the
@@ -212,6 +222,9 @@ class AgentLoop(threading.Thread):
                 feed_scrolls=IDLE_FEED_SCROLLS,
             )
             logger.info("user %s idle feed: %s %s", user_id, feed_run.status, feed_run.stats)
+
+            if not self._still_enabled(db, settings_row):
+                return
 
             # While idle, nudge the home feed towards hiring content: a couple
             # of likes and one follow teach X what to show next time.
@@ -240,11 +253,17 @@ class AgentLoop(threading.Thread):
                 except Exception:  # noqa: BLE001 - never break the loop
                     logger.warning("feed training failed for user %s", user_id, exc_info=True)
 
+            if not self._still_enabled(db, settings_row):
+                return
+
             if feed_run.status == "completed":
                 state = limits.check(db, settings_row, write_action)
                 if state.allowed:
                     send_run = pipeline.send_batch(db, limit=1, user_id=user_id)
                     logger.info("user %s idle send: %s %s", user_id, send_run.status, send_run.stats)
+
+        if not self._still_enabled(db, settings_row):
+            return
 
         # 2b. Keep Approvals clean. Run the AI fit screen for unreviewed pending
         # jobs on a short timer, so jobs found by the idle feed are covered too.
@@ -266,6 +285,9 @@ class AgentLoop(threading.Thread):
             except Exception:  # noqa: BLE001 - never break the loop
                 logger.warning("fit screen failed for user %s", user_id, exc_info=True)
                 db.rollback()
+
+        if not self._still_enabled(db, settings_row):
+            return
 
         # 3. Scanning runs on its own schedule and is never starved by the queue.
         interval = max(1, settings_row.scan_interval_minutes)
@@ -307,12 +329,18 @@ class AgentLoop(threading.Thread):
         else:
             self._empty_scans[user_id] = 0
 
+        if not self._still_enabled(db, settings_row):
+            return
+
         # 4. Immediately start applying to whatever the scan found.
         if scan_run.status == "completed" and not sent_this_tick:
             state = limits.check(db, settings_row, write_action)
             if state.allowed:
                 send_run = pipeline.send_batch(db, limit=1, user_id=user_id)
                 logger.info("user %s send pass: %s %s", user_id, send_run.status, send_run.stats)
+
+        if not self._still_enabled(db, settings_row):
+            return
 
         # 4. Every few hours let the analyst (ChatGPT when configured) grade the
         # keywords and suggest better junior-friendly ones. It only stores
@@ -364,6 +392,9 @@ class AgentLoop(threading.Thread):
             logger.warning("analyst review failed for user %s", user_id, exc_info=True)
             db.rollback()
 
+        if not self._still_enabled(db, settings_row):
+            return
+
         # 5. Watcher: every ~90 min, hand the agent's recent activity to ChatGPT
         # so it can say whether the outreach is healthy and what broke.
         try:
@@ -379,6 +410,12 @@ class AgentLoop(threading.Thread):
         except Exception:  # noqa: BLE001 - the watcher must never break the loop
             logger.warning("watcher failed for user %s", user_id, exc_info=True)
             db.rollback()
+
+    @staticmethod
+    def _still_enabled(db, settings_row) -> bool:
+        # The dashboard uses another session; discard this tick's cached value.
+        db.refresh(settings_row, attribute_names=["enabled"])
+        return settings_row.enabled
 
 
 _loop: AgentLoop | None = None

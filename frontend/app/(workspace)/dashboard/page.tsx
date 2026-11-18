@@ -9,12 +9,14 @@ import {
   ClockIcon,
   Loader2Icon,
   MessageSquareIcon,
+  PauseIcon,
   PlayIcon,
   RadarIcon,
   SearchIcon,
   SendIcon,
   SparklesIcon,
 } from 'lucide-react'
+import { toast } from 'sonner'
 
 import { PageHeader } from '@/components/page-header'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -23,12 +25,38 @@ import { Button, buttonVariants } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Separator, Skeleton } from '@/components/ui/misc'
 import { api } from '@/lib/api'
+import { notifyDataChanged } from '@/lib/events'
 import type { Insight, WatcherReport } from '@/lib/types'
 import { useWorkspace } from '@/lib/use-workspace'
 import { cn, timeAgo } from '@/lib/utils'
 
 export default function DashboardPage() {
-  const { profile, settings, account, dashboard, loading, error } = useWorkspace()
+  const { profile, settings, account, dashboard, loading, error, setState } = useWorkspace()
+  const [toggling, setToggling] = useState(false)
+  const enabled = settings?.enabled ?? false
+
+  async function toggleAgent() {
+    if (!settings || toggling) return
+    setToggling(true)
+    try {
+      const saved = await api.saveSettings({ enabled: !enabled })
+      setState((state) => ({
+        ...state,
+        settings: saved,
+        dashboard: state.dashboard ? { ...state.dashboard, enabled: saved.enabled } : null,
+      }))
+      notifyDataChanged()
+      toast.success(saved.enabled ? 'Agent activated' : 'Agent deactivated', {
+        description: saved.enabled
+          ? 'Background work resumes on the next agent check.'
+          : 'Any current action will finish, then background work stops.',
+      })
+    } catch (err) {
+      toast.error('Could not update the agent', { description: (err as Error).message })
+    } finally {
+      setToggling(false)
+    }
+  }
 
   const usage = dashboard?.usage
   const pending = dashboard?.pending_approvals ?? 0
@@ -49,9 +77,19 @@ export default function DashboardPage() {
               />
               {account ? `@${account.username}` : 'No account'}
             </Badge>
-            <Badge variant={dashboard?.enabled ? 'success' : 'warning'}>
-              {dashboard?.enabled ? 'Agent running' : 'Agent paused'}
+            <Badge variant={!settings ? 'secondary' : enabled ? 'success' : 'warning'}>
+              {!settings ? 'Agent status unavailable' : enabled ? 'Agent running' : 'Agent paused'}
             </Badge>
+            <Button
+              size="sm"
+              variant={enabled ? 'outline' : 'default'}
+              disabled={loading || !settings || !!error || toggling}
+              aria-busy={toggling}
+              onClick={() => void toggleAgent()}
+            >
+              {toggling ? <Loader2Icon className="animate-spin" /> : enabled ? <PauseIcon /> : <PlayIcon />}
+              {toggling ? 'Saving…' : enabled ? 'Deactivate agent' : 'Activate agent'}
+            </Button>
           </>
         }
       />
@@ -93,12 +131,12 @@ export default function DashboardPage() {
 
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1">
-              <span className="size-1.5 animate-pulse rounded-full bg-emerald-500" />
-              Automatic — scans every {settings?.scan_interval_minutes ?? 30} min
+              <span className={cn('size-1.5 rounded-full', enabled ? 'animate-pulse bg-emerald-500' : 'bg-muted-foreground')} />
+              {enabled ? `Automatic — scans every ${settings?.scan_interval_minutes ?? 30} min` : 'Automatic scanning paused'}
             </span>
             <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/30 px-2.5 py-1">
-              <span className="size-1.5 animate-pulse rounded-full bg-sky-500" />
-              Sends queued posts when the cool-down allows
+              <span className={cn('size-1.5 rounded-full', enabled ? 'animate-pulse bg-sky-500' : 'bg-muted-foreground')} />
+              {enabled ? 'Sends queued posts when the cool-down allows' : 'Automatic sending paused'}
             </span>
           </div>
         </div>
@@ -145,7 +183,7 @@ export default function DashboardPage() {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-sm font-semibold">This run loop</h2>
           <Badge variant="secondary">
-            {usage?.in_quiet_hours ? 'quiet hours' : 'active window'}
+            {!enabled ? 'paused' : usage?.in_quiet_hours ? 'quiet hours' : 'active window'}
           </Badge>
         </div>
 
@@ -214,7 +252,7 @@ export default function DashboardPage() {
             <span className="text-muted-foreground">
               {loading
                 ? '…'
-                : dashboard?.enabled
+                : enabled
                   ? 'Scheduled scanning is on'
                   : 'Paused — run manually'}
             </span>
